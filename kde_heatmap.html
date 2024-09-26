@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UMAP Embeddings Heatmap</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        #chart {
+            position: relative;
+        }
+
+        #slider-container {
+            margin-top: 10px; /* Add some spacing above the slider */
+            position: relative; /* Optional: Adds a positioning context */
+            z-index: 10;  /* Set a higher z-index than the canvas */ 
+        }
+
+        .tooltip {
+            position: absolute;
+            background-color: white;
+            border: 1px solid #ddd;
+            padding: 10px;
+            pointer-events: none;
+        }
+
+        #chart canvas {
+            z-index: 1;  /* Ensure canvas has a lower z-index */
+        }
+    </style>
+</head>
+<body>
+    <div id="chart">
+        <div id="slider-container"> 
+            <input type="range" id="kernelWidth" min="0.01" max="1." step="0.01" value="0.1">
+            <p>Kernel Width: <span id="kernelWidthValue">0.1</span></p>
+        </div>
+    <script>
+        let gl, program, pointsTexture, resolutionLocation, pointCountLocation, bandwidthLocation, domainLocation;
+        let canvas;
+        let xDomainMinLocation, xDomainMaxLocation, xRangeMinLocation, xRangeMaxLocation;
+        let yDomainMinLocation, yDomainMaxLocation, yRangeMinLocation, yRangeMaxLocation; // ... other variables ...
+
+        const MAX_POINTS = 1000;  // Assume max number of points we can handle
+
+        // Load your JSON data (replace with appropriate data URL)
+        let x, y;  // We'll declare these globally to be used in both initVisualization and updateHeatmap.
+        let data;
+
+
+        d3.json("kde_heatmap_data.json").then(function (loadedData) {
+            data = loadedData;
+            initVisualization(data);
+            updateHeatmap(0.1);  // Initial bandwidth value for the heatmap
+        }).catch(error => console.error("Failed to load data:", error));
+
+        function initVisualization(data) {
+            const margin = { top: 20, right: 20, bottom: 50, left: 40 };
+            const width = 800 - margin.left - margin.right;
+            const height = 600 - margin.top - margin.bottom;
+            // Create WebGL Canvas for the heatmap 
+            canvas = d3.select("#chart")
+                .append("canvas")
+                .attr("width", width)
+                .attr("height", height)
+                .style("position", "absolute")
+                .style("top", "0px")  // No offset from top
+                .style("left", "0px")  // No offset from left
+                .node();
+
+
+            // After the canvas (heatmap), append the SVG (scatterplot)
+            const svg = d3.select("#chart")
+                .append("svg")
+                .attr("width", width)
+                .attr("height", height)
+                .style("position", "absolute") // Position SVG on top of the canvas
+                .style("top", "0px")  // No offset from top
+                .style("left", "0px")  // No offset from left
+                .style("z-index", 1)           // Ensure this renders in front of the heatmap
+                .append("g")
+                .attr("transform", `translate(0,0)`);
+
+            // Create WebGL Canvas for the heatmap (this must be initialized once)
+            // canvas = d3.select("#chart")
+            //     .append("canvas")
+            //     .attr("width", width)
+            //     .attr("height", height)
+            //     .style("position", "absolute")
+            //     .style("top", `${margin.top}px`)
+            //     .style("left", `${margin.left}px`)
+            //     .node();
+
+            gl = canvas.getContext("webgl2");
+
+            if (!gl) {
+                console.error("WebGL2 is not supported in your browser.");
+                return;
+            }
+
+            // Create shaders and program only once
+            const vertexShaderSource = `#version 300 es
+                precision highp float;
+                in vec2 a_position;
+                void main() {
+                    gl_Position = vec4(a_position, 0, 1);
+                }`;
+
+            const fragmentShaderSource = `#version 300 es
+            precision highp float;
+
+            uniform sampler2D u_points;
+            uniform vec2 u_resolution;
+            uniform float u_pointCount;
+            uniform float u_bandwidth;
+            uniform vec4 u_domain;
+
+            uniform float x_domain_min;
+            uniform float x_domain_max;
+            uniform float x_range_min;
+            uniform float x_range_max;
+            uniform float y_domain_min;
+            uniform float y_domain_max;
+            uniform float y_range_min;
+            uniform float y_range_max;
+
+
+            out vec4 fragColor;
+
+            const int MAX_POINTS = 1000;
+
+            // Gaussian kernel function for KDE
+            float gaussianKernel(float dist, float bandwidth) {
+                return exp(-0.5 * (dist * dist) / (bandwidth * bandwidth));
+            }
+
+            void main() {
+                // Convert the current fragment coordinate (pixel space) to data space
+                vec2 uv = gl_FragCoord.xy / u_resolution;
+
+                // Map screen UV (0 to 1) to the actual data domain coordinates
+                vec2 point = vec2(
+                    mix(u_domain.x, u_domain.y, uv.x),  // Maps from min_x to max_x
+                    mix(u_domain.z, u_domain.w, 1.0 - uv.y)  // Maps from min_y to max_y
+                );
+
+                // Calculate the offset from the SVG scaling
+                float xOffset = (x_range_max - x_range_min) / 2.0;  // Calculate offset based on range
+                float yOffset = (y_range_max - y_range_min) / 2.0;  // Calculate offset based on range
+
+                point -= vec2(xOffset, yOffset);
+
+
+
+                float density = 0.0;
+
+                // Sum the contribution of all points at this pixel's position
+                for (int i = 0; i < MAX_POINTS; i++) {
+                    if (float(i) >= u_pointCount) break;
+
+                    // Get point coordinates from the texture
+                    vec2 dataPoint = texture(u_points, vec2((float(i) + 0.5) / u_pointCount, 0.5)).xy;
+
+                    // Compute distance between the current pixel and this data point
+                    float dist = length(point - dataPoint);
+
+                    // Add the kernel contribution based on distance
+                    density += gaussianKernel(dist, u_bandwidth);
+                }
+
+                // Normalize density value (adjusting based on the number of points)
+                float normalizedDensity = density / float(MAX_POINTS);
+
+                // Assign red color with varying transparency based on density
+                fragColor = vec4(1.0, 0.0, 0.0, normalizedDensity);  // Red, varying alpha
+            }`;
+
+            const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+            const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+            program = createProgram(gl, vertexShader, fragmentShader);
+            const xDomainMinLocation = gl.getUniformLocation(program, "x_domain_min");
+            const xDomainMaxLocation = gl.getUniformLocation(program, "x_domain_max");
+            const xRangeMinLocation = gl.getUniformLocation(program, "x_range_min");
+            const xRangeMaxLocation = gl.getUniformLocation(program, "x_range_max");
+            const yDomainMinLocation = gl.getUniformLocation(program, "y_domain_min");
+            const yDomainMaxLocation = gl.getUniformLocation(program, "y_domain_max");
+            const yRangeMinLocation = gl.getUniformLocation(program, "y_range_min");
+            const yRangeMaxLocation = gl.getUniformLocation(program, "y_range_max");
+
+
+            // Load geometry into WebGL
+            const positionBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([ // Full screen quad
+                -1, -1, 1, -1, -1, 1, 1, 1
+            ]), gl.STATIC_DRAW);
+
+            const positionLocation = gl.getAttribLocation(program, "a_position");
+            gl.enableVertexAttribArray(positionLocation);
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+
+            // Set uniform locations (the uniforms control things like bandwidth, resolution)
+            resolutionLocation = gl.getUniformLocation(program, "u_resolution");
+            pointCountLocation = gl.getUniformLocation(program, "u_pointCount");
+            bandwidthLocation = gl.getUniformLocation(program, "u_bandwidth");
+            domainLocation = gl.getUniformLocation(program, "u_domain");
+
+            // Create textures for the points' data
+            pointsTexture = createPointsTexture(gl, data);
+
+            /* === STEP 2: SVG for Scatterplot === */
+            // After the canvas (heatmap), append the SVG (scatterplot)
+            // const svg = d3.select("#chart")
+            //     .append("svg")
+            //     .attr("width", width + margin.left + margin.right)
+            //     .attr("height", height + margin.top + margin.bottom)
+            //     .style("position", "absolute") // Position SVG on top of the canvas
+            //     .style("top", `${margin.top}px`)
+            //     .style("left", `${margin.left}px`)
+            //     .style("z-index", 1)           // Ensure this renders in front of the heatmap
+            //     .append("g")
+            //     .attr("transform", `translate(${margin.left},${margin.top})`);
+
+            // Scaling functions for points
+            x = d3.scaleLinear()
+                .domain(d3.extent(data, d => d.x))
+                .range([0, width]);
+
+            y = d3.scaleLinear()
+                .domain(d3.extent(data, d => d.y))
+                .range([height, 0]);
+
+            window.x = x;  // Make 'x' globally accessible
+            window.y = y;  // Make 'y' globally accessible
+
+            // Append scatterplot axes
+            svg.append("g")
+                .attr("transform", `translate(0,${height})`)
+                .call(d3.axisBottom(x));
+
+            svg.append("g")
+                .call(d3.axisLeft(y));
+
+            // Append scatterplot points
+            const dots = svg.selectAll(".dot")
+                .data(data)
+                .enter().append("circle")
+                .attr("class", "dot")
+                .attr("cx", d => x(d.x))
+                .attr("cy", d => y(d.y))
+                .attr("r", 5)
+                .style("fill", "blue")
+                .style("opacity", 0.7);
+
+            /* === TOOLTIP for Scatterplot === */
+            const tooltip = d3.select("body").append("div")
+                .attr("class", "tooltip")
+                .style("opacity", 0);
+
+            // Mouseover event to show tooltips
+            dots.on("mouseover", (event, d) => {
+                tooltip.transition()
+                    .duration(200)
+                    .style("opacity", .9);
+                tooltip.html(d.text)
+                    .style("left", (event.pageX + 10) + "px")
+                    .style("top", (event.pageY - 28) + "px");
+            }).on("mouseout", () => {
+                tooltip.transition()
+                    .duration(500)
+                    .style("opacity", 0);
+            });
+        }
+
+
+        // Update the WebGL heatmap based on the kernel bandwidth value (don't recompile shaders here!)
+        function updateHeatmap(bandwidth) {
+            gl.useProgram(program);
+
+            gl.uniform1f(xDomainMinLocation, x.domain()[0]);
+            gl.uniform1f(xDomainMaxLocation, x.domain()[1]);
+            gl.uniform1f(xRangeMinLocation, x.range()[0]);
+            gl.uniform1f(xRangeMaxLocation, x.range()[1]);
+            gl.uniform1f(yDomainMinLocation, y.domain()[0]);
+            gl.uniform1f(yDomainMaxLocation, y.domain()[1]);
+            gl.uniform1f(yRangeMinLocation, y.range()[0]);
+            gl.uniform1f(yRangeMaxLocation, y.range()[1]);
+
+            // Update the canvas resolution
+            gl.uniform2f(resolutionLocation, canvas.width, canvas.height);
+
+            // Bind the points texture
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, pointsTexture);
+
+            // Pass the number of points and kernel bandwidth
+            gl.uniform1f(pointCountLocation, data.length);  // Point count from data
+            gl.uniform1f(bandwidthLocation, bandwidth);     // Bandwidth from the slider
+
+            // Pass the D3 domain ranges (x and y axis extents)
+            gl.uniform4f(domainLocation,
+                x.domain()[0], x.domain()[1],  // x_min, x_max
+                y.domain()[1], y.domain()[0]); // y_min, y_max (flipped for WebGL)
+
+            // Draw the heatmap
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        }
+
+
+
+        function createShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error(gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        function createProgram(gl, vertexShader, fragmentShader) {
+            const program = gl.createProgram();
+            gl.attachShader(program, vertexShader);
+            gl.attachShader(program, fragmentShader);
+            gl.linkProgram(program);
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                console.error(gl.getProgramInfoLog(program));
+                gl.deleteProgram(program);
+                return null;
+            }
+            return program;
+        }
+
+        function createPointsTexture(gl, data) {
+            const texture = gl.createTexture();
+            const pointsData = new Float32Array(data.flatMap(d => [d.x, d.y]));
+
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32F, data.length, 1, 0, gl.RG, gl.FLOAT, pointsData);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+            return texture;
+        }
+
+        // Event handler for slider for interaction
+        d3.select("#kernelWidth").on("input", function () {
+            const bandwidth = +this.value;
+            d3.select("#kernelWidthValue").text(bandwidth);
+            updateHeatmap(bandwidth);
+        });
+
+
+    </script>
+</body>
+
+</html>
